@@ -1,0 +1,387 @@
+name: Build Jarvis APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write project files
+        run: |
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'JARVIS_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Jarvis"
+          include(":app")
+          JARVIS_EOF
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'JARVIS_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          JARVIS_EOF
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'JARVIS_EOF'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          JARVIS_EOF
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'JARVIS_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.jarvis"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.jarvis"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("net.java.dev.jna:jna:5.13.0@aar")
+              implementation("com.alphacephei:vosk-android:0.3.47")
+          }
+          JARVIS_EOF
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'JARVIS_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.CALL_PHONE"/>
+              <uses-permission android:name="android.permission.READ_CONTACTS"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="com.android.alarm.permission.SET_ALARM"/>
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN"/>
+                      <category android:name="android.intent.category.LAUNCHER"/>
+                  </intent>
+                  <intent><action android:name="android.intent.action.TTS_SERVICE"/></intent>
+                  <package android:name="com.google.android.youtube"/>
+                  <package android:name="com.google.android.apps.maps"/>
+              </queries>
+              <application android:label="Jarvis">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".JarvisService" android:exported="false"
+                      android:foregroundServiceType="microphone"/>
+              </application>
+          </manifest>
+          JARVIS_EOF
+          mkdir -p $(dirname app/src/main/java/com/example/jarvis/MainActivity.kt)
+          cat > app/src/main/java/com/example/jarvis/MainActivity.kt <<'JARVIS_EOF'
+          package com.example.jarvis
+
+          import android.Manifest.permission.*
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val l = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48) }
+                  fun btn(t: String, f: () -> Unit) =
+                      l.addView(Button(this).apply { text = t; setOnClickListener { f() } })
+                  l.addView(TextView(this).apply { text = "JARVIS\nPehle 1, phir 2, phir 3 dabao"; textSize = 18f })
+                  btn("1. Permissions do") {
+                      requestPermissions(arrayOf(RECORD_AUDIO, CALL_PHONE, READ_CONTACTS, POST_NOTIFICATIONS), 1)
+                  }
+                  btn("2. Meri awaaz register karo") { svc(JarvisService.ENROLL) }
+                  btn("3. Jarvis ON") { svc(null) }
+                  btn("Jarvis OFF") { stopService(Intent(this, JarvisService::class.java)) }
+                  setContentView(l)
+              }
+
+              override fun onRequestPermissionsResult(c: Int, p: Array<out String>, r: IntArray) {
+                  if (!Settings.canDrawOverlays(this))
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+              }
+
+              private fun svc(action: String?) =
+                  startForegroundService(Intent(this, JarvisService::class.java).setAction(action))
+          }
+          JARVIS_EOF
+          mkdir -p $(dirname app/src/main/java/com/example/jarvis/JarvisService.kt)
+          cat > app/src/main/java/com/example/jarvis/JarvisService.kt <<'JARVIS_EOF'
+          package com.example.jarvis
+
+          import android.app.*
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.hardware.camera2.CameraManager
+          import android.media.AudioManager
+          import android.net.Uri
+          import android.os.*
+          import android.provider.AlarmClock
+          import android.provider.ContactsContract
+          import android.provider.MediaStore
+          import android.provider.Settings
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import android.view.KeyEvent
+          import org.json.JSONObject
+          import org.vosk.Model
+          import org.vosk.Recognizer
+          import org.vosk.SpeakerModel
+          import org.vosk.android.RecognitionListener
+          import org.vosk.android.SpeechService
+          import org.vosk.android.StorageService
+          import java.text.SimpleDateFormat
+          import java.util.*
+          import kotlin.math.sqrt
+
+          class JarvisService : Service(), TextToSpeech.OnInitListener, RecognitionListener {
+              companion object {
+                  const val ENROLL = "enroll"
+                  const val THRESH = 0.55 // chhota = zyada strict. Agar tumhe hi ignore kare to 0.65 karo
+              }
+
+              private val h = Handler(Looper.getMainLooper())
+              private lateinit var tts: TextToSpeech
+              private var speech: SpeechService? = null
+              private var ttsReady = false
+              private var started = false
+              private var pendingEnroll = false
+              private var enrolling = false
+              private val samples = mutableListOf<DoubleArray>()
+              private var voice: DoubleArray? = null
+              private var awake = false
+              private var awakeAt = 0L
+              private var torchOn = false
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  getSystemService(NotificationManager::class.java)
+                      .createNotificationChannel(NotificationChannel("jarvis", "Jarvis", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, "jarvis").setContentTitle("Jarvis sun raha hai")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now).build()
+                  startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  voice = getSharedPreferences("j", 0).getString("voice", null)
+                      ?.split(",")?.map { it.toDouble() }?.toDoubleArray()
+                  tts = TextToSpeech(this, this)
+                  Thread {
+                      try {
+                          val en = StorageService.sync(this, "model-en", "model-en")
+                          val sp = StorageService.sync(this, "model-spk", "model-spk")
+                          val rec = Recognizer(Model(en), 16000f, SpeakerModel(sp))
+                          h.post { speech = SpeechService(rec, 16000f); begin() }
+                      } catch (e: Exception) { h.post { say("Model load nahi hua") } }
+                  }.start()
+              }
+
+              override fun onInit(s: Int) {
+                  tts.language = Locale("en", "IN")
+                  tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                      override fun onStart(u: String?) {}
+                      override fun onError(u: String?) { h.post { speech?.setPause(false) } }
+                      override fun onDone(u: String?) { h.postDelayed({ speech?.setPause(false) }, 300) }
+                  })
+                  ttsReady = true
+                  begin()
+              }
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  if (i?.action == ENROLL) { pendingEnroll = true; if (started) startEnroll() }
+                  return START_STICKY
+              }
+
+              override fun onDestroy() {
+                  speech?.stop(); speech?.shutdown(); tts.shutdown(); super.onDestroy()
+              }
+
+              private fun begin() {
+                  if (!ttsReady || speech == null || started) return
+                  started = true
+                  speech!!.startListening(this)
+                  if (pendingEnroll) startEnroll() else say("Jarvis taiyaar hai")
+              }
+
+              // Jarvis ki apni awaaz mic mein na jaye, isliye bolte time sunna band
+              private fun say(t: String) {
+                  if (!ttsReady) return
+                  speech?.setPause(true)
+                  tts.speak(t, TextToSpeech.QUEUE_FLUSH, null, "j")
+              }
+
+              // ---------- Awaaz register ----------
+              private fun startEnroll() {
+                  pendingEnroll = false; enrolling = true; samples.clear()
+                  say("Kuch bhi paanch lambe vakya boliye, ek ek karke")
+              }
+
+              private fun finishEnroll() {
+                  val avg = DoubleArray(samples[0].size) { i -> samples.sumOf { it[i] } / samples.size }
+                  voice = avg
+                  getSharedPreferences("j", 0).edit().putString("voice", avg.joinToString(",")).apply()
+                  enrolling = false
+                  say("Awaaz register ho gayi. Ab sirf aapki sunungi")
+              }
+
+              private fun dist(a: DoubleArray, b: DoubleArray): Double {
+                  var d = 0.0; var x = 0.0; var y = 0.0
+                  for (i in a.indices) { d += a[i] * b[i]; x += a[i] * a[i]; y += b[i] * b[i] }
+                  return 1 - d / (sqrt(x) * sqrt(y))
+              }
+
+              // ---------- Vosk callbacks ----------
+              override fun onPartialResult(p: String?) {}
+              override fun onFinalResult(p: String?) {}
+              override fun onTimeout() {}
+              override fun onError(e: Exception?) { say("Mic mein dikkat aayi") }
+
+              override fun onResult(hyp: String) {
+                  val j = JSONObject(hyp)
+                  val text = j.optString("text").trim().lowercase()
+                  if (text.isEmpty()) return
+                  val frames = j.optInt("spk_frames")
+                  val v = j.optJSONArray("spk")?.let { a -> DoubleArray(a.length()) { a.getDouble(it) } }
+
+                  if (enrolling) {
+                      if (v != null && frames >= 100) {
+                          samples.add(v); say("${samples.size} ho gaya")
+                          if (samples.size >= 5) finishEnroll()
+                      } else say("Thoda lamba boliye")
+                      return
+                  }
+
+                  val now = System.currentTimeMillis()
+                  if (awake && now - awakeAt > 8000) awake = false
+                  var cmd = text
+                  if (!awake) {
+                      if (!text.contains("jarvis")) return
+                      cmd = text.substringAfter("jarvis").trim()
+                  }
+                  val ref = voice
+                  if (ref == null) { say("Pehle app mein meri awaaz register karo"); return }
+                  if (cmd.isEmpty()) { awake = true; awakeAt = now; say("Ji boliye"); return }
+
+                  // Sirf tumhari awaaz: speaker match nahi hua to chup-chaap ignore
+                  val limit = THRESH + if (frames < 80) 0.1 else 0.0
+                  if (v == null || frames < 30 || dist(ref, v) > limit) return
+                  awake = false
+                  execute(cmd)
+              }
+
+              // ---------- Commands ----------
+              private fun r(c: String, p: String) = Regex(p).containsMatchIn(c)
+
+              private fun go(i: Intent) {
+                  try { startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } catch (e: Exception) { say("Ye nahi ho paya") }
+              }
+
+              private fun execute(c: String) {
+                  val n = Regex("\\d+").findAll(c).map { it.value.toInt() }.toList()
+                  when {
+                      r(c, "torch|flashlight") -> {
+                          val on = !r(c, "off|band|bujha"); torch(on); say(if (on) "Torch on" else "Torch off")
+                      }
+                      r(c, "battery") -> say("Battery " + getSystemService(BatteryManager::class.java)
+                          .getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) + " percent hai")
+                      r(c, "alarm") && n.isNotEmpty() -> {
+                          var hr = n[0]; if (c.contains("pm") && hr < 12) hr += 12
+                          go(Intent(AlarmClock.ACTION_SET_ALARM).putExtra(AlarmClock.EXTRA_HOUR, hr)
+                              .putExtra(AlarmClock.EXTRA_MINUTES, n.getOrElse(1) { 0 }).putExtra(AlarmClock.EXTRA_SKIP_UI, true))
+                          say("Alarm set ho gaya")
+                      }
+                      r(c, "timer") && n.isNotEmpty() -> {
+                          val mul = if (c.contains("second")) 1 else if (r(c, "hour|ghant")) 3600 else 60
+                          go(Intent(AlarmClock.ACTION_SET_TIMER).putExtra(AlarmClock.EXTRA_LENGTH, n[0] * mul)
+                              .putExtra(AlarmClock.EXTRA_SKIP_UI, true))
+                          say("Timer shuru")
+                      }
+                      r(c, "\\btime\\b|samay|kitne baje") -> say(SimpleDateFormat("h:mm a", Locale.ENGLISH).format(Date()))
+                      r(c, "\\bdate\\b|which day|kaun sa din") -> say(SimpleDateFormat("EEEE, d MMMM", Locale.ENGLISH).format(Date()))
+                      r(c, "weather|mausam") -> search("weather today")
+                      r(c, "youtube") && r(c, "play|chalao|search") -> {
+                          val q = c.replace(Regex("play|chalao|search|on youtube|youtube|pe|par"), "").trim()
+                          go(Intent(Intent.ACTION_SEARCH).setPackage("com.google.android.youtube").putExtra("query", q))
+                          say("YouTube pe $q")
+                      }
+                      r(c, "navigate|directions|rasta") -> {
+                          val p = c.replace(Regex("navigate( to)?|directions( to)?|rasta"), "").trim()
+                          go(Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=" + Uri.encode(p)))
+                              .setPackage("com.google.android.apps.maps"))
+                      }
+                      r(c, "^(search|google)\\b") -> search(c.replace(Regex("^(search|google)( for)?"), "").trim())
+                      r(c, "camera|photo") -> go(Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA))
+                      r(c, "wifi|wi-fi") -> go(Intent(Settings.ACTION_WIFI_SETTINGS))
+                      r(c, "bluetooth") -> go(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+                      r(c, "\\bcall\\b") -> call(c.replace(Regex("\\b(call|karo|kar|ko|do|please)\\b"), "").trim())
+                      r(c, "^open |kholo|khol do") ->
+                          openApp(c.replace(Regex("\\b(open|kholo|khol|do|please)\\b"), "").trim())
+                      r(c, "pause|roko|ruko|\\bstop\\b") -> key(KeyEvent.KEYCODE_MEDIA_PAUSE)
+                      r(c, "play|chalao") -> key(KeyEvent.KEYCODE_MEDIA_PLAY)
+                      r(c, "next|agla") -> key(KeyEvent.KEYCODE_MEDIA_NEXT)
+                      r(c, "previous|pichla") -> key(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
+                      r(c, "volume") -> getSystemService(AudioManager::class.java).adjustStreamVolume(
+                          AudioManager.STREAM_MUSIC,
+                          if (r(c, "up|badha|increase")) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER,
+                          AudioManager.FLAG_SHOW_UI)
+                      r(c, "joke") -> say(listOf(
+                          "Programmer ko khaane mein kya pasand hai? Bugs, par sirf fried.",
+                          "Phone ne doctor se kaha, mujhe bahut hang hota hai. Doctor bola, pehle cache saaf karo.",
+                          "Mera WiFi aur meri kismat, dono ka signal weak hai.").random())
+                      r(c, "shutdown|shut down|band ho ja") -> { say("Bye boss"); h.postDelayed({ stopSelf() }, 1500) }
+                      else -> say("Samajh nahi aaya")
+                  }
+              }
+
+              private fun search(q: String) = go(Intent(Intent.ACTION_WEB_SEARCH).putExtra(android.app.SearchManager.QUERY, q))
+
+              private fun torch(on: Boolean) {
+                  try {
+                      val cm = getSystemService(CameraManager::class.java)
+                      cm.setTorchMode(cm.cameraIdList[0], on); torchOn = on
+                  } catch (e: Exception) { say("Torch nahi chali") }
+              }
+
+              private fun key(k: Int) {
+                  val am = getSystemService(AudioManager::class.java)
+                  am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, k))
+                  am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, k))
+              }
+
+              private fun openApp(name: String) {
+                  val m = packageManager.queryIntentActivities(
+                      Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0
+                  ).firstOrNull { it.loadLabel(packageManager).toString().lowercase().contains(name) }
+                  val i = m?.let { packageManager.getLaunchIntentForPackage(it.activityInfo.packageName) }
+                  if (i != null) { say("$name kho
